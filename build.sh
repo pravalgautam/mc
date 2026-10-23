@@ -16,6 +16,7 @@ cat > mc.app/Contents/Info.plist <<PLIST
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
+  <key>NSMicrophoneUsageDescription</key><string>Disco mode pulses the screen with the music.</string>
   <key>NSBluetoothAlwaysUsageDescription</key><string>Turns the monitor off when your phone or watch walks away.</string>
 </dict></plist>
 PLIST

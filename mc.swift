@@ -7,6 +7,8 @@ import ServiceManagement
 import CoreAudio
 import CoreBluetooth
 import CoreMediaIO
+import AVFoundation
+import Carbon
 
 @_silgen_name("IOAVServiceCreateWithService")
 func IOAVServiceCreateWithService(_ a: CFAllocator?, _ s: io_service_t) -> Unmanaged<CFTypeRef>?
@@ -51,6 +53,42 @@ func getVCP(_ s: CFTypeRef, _ code: UInt8) -> (cur: Int, max: Int)? {
     return (Int(b[8]) << 8 | Int(b[9]), Int(b[6]) << 8 | Int(b[7]))
 }
 
+// Rotation via private MonitorPanel (what System Settings uses); no public API for it.
+func externalPanel() -> NSObject? {
+    dlopen("/System/Library/PrivateFrameworks/MonitorPanel.framework/MonitorPanel", RTLD_NOW)
+    guard let cls = NSClassFromString("MPDisplayMgr") as? NSObject.Type else { return nil }
+    let displays = cls.init().value(forKey: "displays") as? [NSObject] ?? []
+    return displays.first { ($0.value(forKey: "isBuiltIn") as? Bool) == false }
+}
+
+func externalID() -> CGDirectDisplayID? {
+    var ids = [CGDirectDisplayID](repeating: 0, count: 8), n: UInt32 = 0
+    CGGetOnlineDisplayList(8, &ids, &n)
+    return ids.prefix(Int(n)).first { CGDisplayIsBuiltin($0) == 0 }
+}
+
+// Includes the scaled HiDPI modes System Settings hides behind "Show all resolutions".
+func displayModes(_ id: CGDirectDisplayID) -> [CGDisplayMode] {
+    let opts = [kCGDisplayShowDuplicateLowResolutionModes: true] as CFDictionary
+    return (CGDisplayCopyAllDisplayModes(id, opts) as? [CGDisplayMode] ?? []).filter { $0.isUsableForDesktopGUI() }
+}
+
+func setMode(_ id: CGDirectDisplayID, _ m: CGDisplayMode) {
+    var c: CGDisplayConfigRef?
+    CGBeginDisplayConfiguration(&c)
+    CGConfigureDisplayWithDisplayMode(c, id, m, nil)
+    CGCompleteDisplayConfiguration(c, .permanently)
+}
+
+func orientation() -> Int { externalPanel()?.value(forKey: "orientation") as? Int ?? 0 }
+
+func rotate(_ deg: Int) {
+    guard let d = externalPanel() else { return }
+    let sel = NSSelectorFromString("setOrientation:")
+    typealias F = @convention(c) (AnyObject, Selector, Int32) -> Void
+    unsafeBitCast(d.method(for: sel), to: F.self)(d, sel, Int32(deg))
+}
+
 func num(_ s: String) -> Int? { s.hasPrefix("0x") ? Int(s.dropFirst(2), radix: 16) : Int(s) }
 
 let usage = """
@@ -60,6 +98,7 @@ usage: mc brightness [0-100]      get/set brightness (VCP 0x10)
        mc get <vcp>               read any VCP code (hex ok: 0xD6)
        mc set <vcp> <value>       write any VCP code
        mc scan                    dump every readable VCP code
+       mc flip                    rotate the monitor 180° (again to undo)
        mc [menubar]               menu bar app (default with no args)
 """
 
@@ -69,15 +108,18 @@ let cmd = a.first ?? "menubar"  // no args (e.g. launched as mc.app) opens the m
 // Gamma state, main thread only. softBrightness is used only when DDC fails.
 var softBrightness = 100
 var warm = false
+var nightPreset = false  // Night preset forces the warm tint regardless of the hour
+var locked = false  // lock blackout: external screen fully black
+var fxTint: (Float, Float, Float)?  // disco/matrix tint, overrides warm/meeting
 var meeting = false  // camera on: full brightness + light warm tint
 
 // Software dimming + warm tint via gamma on external displays. Resets when the app quits.
 func applyGamma() {
     var ids = [CGDirectDisplayID](repeating: 0, count: 8), n: UInt32 = 0
     CGGetOnlineDisplayList(8, &ids, &n)
-    let k = meeting ? 1 : Float(max(softBrightness, 5)) / 100  // ponytail: 5% floor so the screen never goes fully black
+    let k = locked ? 0 : fxTint != nil || meeting ? 1 : Float(max(softBrightness, 5)) / 100  // ponytail: 5% floor so the screen never goes fully black
     // ponytail: fixed ~3400K tint, add a strength slider if wanted
-    let (r, g, b): (Float, Float, Float) = meeting ? (1, 0.93, 0.85) : warm ? (1, 0.82, 0.62) : (1, 1, 1)
+    let (r, g, b): (Float, Float, Float) = fxTint ?? (meeting ? (1, 0.93, 0.85) : warm ? (1, 0.82, 0.62) : (1, 1, 1))
     for id in ids.prefix(Int(n)) where CGDisplayIsBuiltin(id) == 0 {
         CGSetDisplayTransferByFormula(id, 0, k * r, 1, 0, k * g, 1, 0, k * b, 1)
     }
@@ -158,7 +200,7 @@ final class MenuBar: NSObject, NSMenuDelegate {
 
     override init() {
         super.init()
-        prefs.register(defaults: ["meetingGlow": true, "warmAtNight": true, "keys": true, "ledOn": true])
+        prefs.register(defaults: ["meetingGlow": true, "warmAtNight": true, "keys": true, "ledOn": true, "lockBlackout": true, "matrixIdle": true])
         item.button?.image = NSImage(systemSymbolName: "sun.max", accessibilityDescription: "Brightness")
 
         let m = NSMenu()
@@ -174,15 +216,43 @@ final class MenuBar: NSObject, NSMenuDelegate {
             i.tag = v
         }
         m.addItem(withTitle: "Input", action: nil, keyEquivalent: "").submenu = inputs
+        let presets = NSMenu()
+        for (n, name) in presetValues.map(\.name).enumerated() {
+            let i = presets.addItem(withTitle: name, action: #selector(preset(_:)), keyEquivalent: "")
+            i.target = self
+            i.tag = n
+        }
+        m.addItem(withTitle: "Preset", action: nil, keyEquivalent: "").submenu = presets
         let walkMenu = NSMenu()
         walkMenu.delegate = self
         m.addItem(withTitle: "Walk-Away Off", action: nil, keyEquivalent: "").submenu = walkMenu
         if prefs.string(forKey: "walkDevice") != nil { _ = walk }
+        let rot = NSMenu()
+        rot.delegate = self
+        for deg in [0, 90, 180, 270] {
+            let i = rot.addItem(withTitle: "\(deg)°", action: #selector(pickRotation(_:)), keyEquivalent: "")
+            i.target = self
+            i.tag = deg
+        }
+        m.addItem(withTitle: "Rotate", action: nil, keyEquivalent: "").submenu = rot
+        for title in ["Resolution", "Refresh Rate"] {  // filled in menuNeedsUpdate
+            let sub = NSMenu(title: title)
+            sub.delegate = self
+            m.addItem(withTitle: title, action: nil, keyEquivalent: "").submenu = sub
+        }
         if ledVCP > 0 { toggle(m, "Power Light", #selector(toggleLED(_:)), prefs.bool(forKey: "ledOn")) }
         m.addItem(.separator())
 
         toggle(m, "Meeting Glow", #selector(toggleGlow(_:)), prefs.bool(forKey: "meetingGlow"))
         toggle(m, "Warm Colour at Night", #selector(toggleWarm(_:)), prefs.bool(forKey: "warmAtNight"))
+        discoItem = toggle(m, "Disco Mode", #selector(toggleDisco(_:)), false)
+        toggle(m, "Disco Party (spins on beats)", #selector(toggleParty(_:)), false)
+        toggle(m, "Matrix When Idle", #selector(toggleMatrix(_:)), prefs.bool(forKey: "matrixIdle"))
+        m.addItem(withTitle: "Screen Wipe", action: #selector(screenWipe), keyEquivalent: "").target = self
+        let coin = m.addItem(withTitle: "Heads or Tails", action: #selector(headsOrTails), keyEquivalent: "f")
+        coin.keyEquivalentModifierMask = [.control, .option]
+        coin.target = self
+        toggle(m, "Black Out When Locked", #selector(toggleBlackout(_:)), prefs.bool(forKey: "lockBlackout"))
         toggle(m, "Media Keys Control Monitor", #selector(toggleKeys(_:)), prefs.bool(forKey: "keys"))
         if !prefs.bool(forKey: "loginAsked") {  // turn Start at Login on once, user can untick it
             prefs.set(true, forKey: "loginAsked")
@@ -210,6 +280,11 @@ final class MenuBar: NSObject, NSMenuDelegate {
         NotificationCenter.default.addObserver(self, selector: #selector(tick), name: NSApplication.didChangeScreenParametersNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(tick), name: NSWorkspace.didWakeNotification, object: nil)
         Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.checkCamera() }
+        Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in self?.matrixTick() }
+        registerHotKey()
+        let dnc = DistributedNotificationCenter.default()
+        dnc.addObserver(forName: .init("com.apple.screenIsLocked"), object: nil, queue: .main) { [weak self] _ in self?.lockChanged(true) }
+        dnc.addObserver(forName: .init("com.apple.screenIsUnlocked"), object: nil, queue: .main) { [weak self] _ in self?.lockChanged(false) }
         tick()
     }
 
@@ -288,6 +363,22 @@ final class MenuBar: NSObject, NSMenuDelegate {
         return t == kAudioDeviceTransportTypeHDMI || t == kAudioDeviceTransportTypeDisplayPort
     }
 
+    // ponytail: fixed values, tweak here if a preset looks off on your monitor
+    let presetValues = [(name: "Reading", brightness: 60, contrast: 50, warm: false),
+                        (name: "Movie", brightness: 90, contrast: 75, warm: false),
+                        (name: "Night", brightness: 20, contrast: 40, warm: true)]
+
+    @objc func preset(_ i: NSMenuItem) {
+        let p = presetValues[i.tag]
+        for (code, v) in [(UInt8(0x10), p.brightness), (0x12, p.contrast)] {
+            sliders[code]?.doubleValue = Double(v)
+            set(code, v)
+        }
+        for item in i.menu?.items ?? [] { item.state = item === i ? .on : .off }
+        nightPreset = p.warm
+        tick()
+    }
+
     @objc func input(_ i: NSMenuItem) {
         let v = UInt16(i.tag)
         if let s = svc { q.async { _ = setVCP(s, 0x60, v) } }
@@ -295,6 +386,12 @@ final class MenuBar: NSObject, NSMenuDelegate {
 
     // Rebuilt each time the Walk-Away submenu opens, strongest signal first.
     func menuNeedsUpdate(_ m: NSMenu) {
+        if m.title == "Resolution" || m.title == "Refresh Rate" { return fillModes(m) }
+        if m.items.first?.action == #selector(pickRotation(_:)) {
+            let cur = orientation()
+            for i in m.items { i.state = i.tag == cur ? .on : .off }
+            return
+        }
         m.removeAllItems()
         let off = m.addItem(withTitle: "Off", action: #selector(pickWalk(_:)), keyEquivalent: "")
         off.target = self
@@ -339,6 +436,191 @@ final class MenuBar: NSObject, NSMenuDelegate {
         if let s = svc { q.async { [ledVCP] in _ = setVCP(s, ledVCP, on ? 1 : 0) } }
     }
 
+    // Resolution keeps the current refresh rate when it can; Refresh Rate lists rates for the current resolution.
+    func fillModes(_ m: NSMenu) {
+        m.removeAllItems()
+        guard let id = externalID(), let cur = CGDisplayCopyDisplayMode(id) else { return }
+        let all = displayModes(id)
+        let hidpi = { (x: CGDisplayMode) in x.pixelWidth > x.width }
+        var picks: [(String, CGDisplayMode, Bool)] = []
+        if m.title == "Resolution" {
+            let sizes = Dictionary(grouping: all.filter { $0.width >= 1024 }) { "\($0.width)×\($0.height)\(hidpi($0) ? " HiDPI" : "")" }
+            for (name, ms) in sizes {
+                let best = ms.first { $0.refreshRate == cur.refreshRate } ?? ms.max { $0.refreshRate < $1.refreshRate }!
+                picks.append((name, best, best.width == cur.width && best.height == cur.height && hidpi(best) == hidpi(cur)))
+            }
+            picks.sort { ($0.1.width, $0.1.pixelWidth) > ($1.1.width, $1.1.pixelWidth) }
+        } else {
+            let same = all.filter { $0.width == cur.width && $0.height == cur.height && $0.pixelWidth == cur.pixelWidth }
+            for r in Set(same.map(\.refreshRate)).sorted(by: >) {
+                picks.append(("\(Int(r)) Hz", same.first { $0.refreshRate == r }!, r == cur.refreshRate))
+            }
+        }
+        for (name, mode, on) in picks {
+            let i = m.addItem(withTitle: name, action: #selector(pickMode(_:)), keyEquivalent: "")
+            i.target = self
+            i.representedObject = mode
+            i.state = on ? .on : .off
+        }
+    }
+
+    @objc func pickMode(_ i: NSMenuItem) {
+        guard let id = externalID(), let mode = i.representedObject else { return }
+        setMode(id, mode as! CGDisplayMode)
+    }
+
+    @objc func pickRotation(_ i: NSMenuItem) { rotate(i.tag) }
+
+    // Hue drifts on its own and jumps with loudness; brightness pulses with it.
+    // ponytail: mic, not system audio (Core Audio process taps are ~10x the code); needs speakers, not headphones.
+    var discoTimer: Timer?
+    var engine: AVAudioEngine?
+    var level: Float = 0
+    var hue: CGFloat = 0
+
+    @objc func toggleDisco(_ i: NSMenuItem) {
+        if let t = discoTimer {
+            t.invalidate(); discoTimer = nil
+            engine?.stop(); engine = nil
+            fxTint = nil; applyGamma()
+            if party && orientation() != 0 { rotate(0) }
+            i.state = .off
+            return
+        }
+        i.state = .on
+        let e = AVAudioEngine()
+        let input = e.inputNode
+        input.installTap(onBus: 0, bufferSize: 1024, format: input.outputFormat(forBus: 0)) { [weak self] buf, _ in
+            guard let p = buf.floatChannelData?[0], buf.frameLength > 0 else { return }
+            var sum: Float = 0
+            for j in 0..<Int(buf.frameLength) { sum += p[j] * p[j] }
+            let rms = min(1, sqrt(sum / Float(buf.frameLength)) * 8)  // ponytail: x8 gain, raise if it barely reacts
+            DispatchQueue.main.async {
+                guard let s = self else { return }
+                // A sudden jump over the decaying level counts as a beat.
+                if s.party, rms > 0.5, rms > s.level * 1.8, Date().timeIntervalSince(s.lastSpin) > 4 {  // ponytail: 4s cooldown, a rotation takes ~1s
+                    s.lastSpin = Date()
+                    let cur = orientation()
+                    rotate([0, 90, 180, 270].filter { $0 != cur }.randomElement()!)
+                }
+                s.level = max(s.level, rms)
+            }
+        }
+        try? e.start()  // no mic permission: still cycles colours, just doesn't pulse
+        engine = e
+        discoTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
+            guard let s = self else { return }
+            s.hue = (s.hue + 0.003 + CGFloat(s.level) * 0.03).truncatingRemainder(dividingBy: 1)
+            let c = NSColor(hue: s.hue, saturation: 0.6, brightness: 0.55 + 0.45 * CGFloat(s.level), alpha: 1)
+            fxTint = (Float(c.redComponent), Float(c.greenComponent), Float(c.blueComponent))
+            s.level *= 0.9
+            applyGamma()
+        }
+    }
+
+    var discoItem: NSMenuItem?
+    var party = false
+    var lastSpin = Date.distantPast
+
+    @objc func toggleParty(_ i: NSMenuItem) {
+        party.toggle()
+        i.state = party ? .on : .off
+        if party, discoTimer == nil, let d = discoItem { toggleDisco(d) }
+        if !party && orientation() != 0 { rotate(0) }
+    }
+
+    // Green, flickering hacker tint after 2 min without input; any input clears it.
+    var matrixOn = false
+
+    func matrixTick() {
+        let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: ~0)!) > 120
+        let on = idle && prefs.bool(forKey: "matrixIdle") && discoTimer == nil
+        if on {
+            let k: Float = Float.random(in: 0...1) < 0.15 ? Float.random(in: 0.75...0.9) : 1  // occasional flicker
+            fxTint = (0.3 * k, k, 0.4 * k)
+            applyGamma()
+        } else if matrixOn {
+            fxTint = nil
+            applyGamma()
+        }
+        matrixOn = on
+    }
+
+    @objc func toggleMatrix(_ i: NSMenuItem) {
+        i.state = i.state == .on ? .off : .on
+        prefs.set(i.state == .on, forKey: "matrixIdle")
+    }
+
+    // A rainbow band sweeps across the external screen in a click-through overlay window.
+    var wipeWindow: NSWindow?
+
+    @objc func screenWipe() {
+        let id = externalID()
+        guard wipeWindow == nil, let screen = NSScreen.screens.first(where: {
+            ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID) == id
+        }) else { return }
+        let w = NSWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
+        w.isOpaque = false
+        w.backgroundColor = .clear
+        w.ignoresMouseEvents = true
+        w.level = .screenSaver
+        w.isReleasedWhenClosed = false
+        w.contentView!.wantsLayer = true
+        let size = screen.frame.size
+        let band = CAGradientLayer()
+        band.colors = [NSColor.clear, .systemCyan, .systemPink, .systemYellow, .clear].map { ($0 == .clear ? $0 : $0.withAlphaComponent(0.6)).cgColor }
+        band.startPoint = CGPoint(x: 0, y: 0.5)
+        band.endPoint = CGPoint(x: 1, y: 0.5)
+        band.frame = CGRect(x: 0, y: 0, width: size.width * 0.6, height: size.height)
+        w.contentView!.layer!.addSublayer(band)
+        w.setFrame(screen.frame, display: true)
+        w.orderFrontRegardless()
+        wipeWindow = w
+        NSSound(named: "Blow")?.play()  // ponytail: closest built-in sound to a whoosh
+        CATransaction.begin()
+        CATransaction.setCompletionBlock { [weak self] in self?.wipeWindow?.orderOut(nil); self?.wipeWindow = nil }
+        let a = CABasicAnimation(keyPath: "position.x")
+        a.fromValue = -size.width * 0.3
+        a.toValue = size.width * 1.3
+        a.duration = 1.2
+        a.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        band.position.x = size.width * 1.3
+        band.add(a, forKey: nil)
+        CATransaction.commit()
+    }
+
+    // Tails (180°) means take a break. Global ⌃⌥F via Carbon: no Accessibility permission needed.
+    @objc func headsOrTails() {
+        let tails = Bool.random()
+        rotate(tails ? 180 : 0)
+        NSSound(named: tails ? "Funk" : "Glass")?.play()
+    }
+
+    var hotKey: EventHotKeyRef?
+
+    func registerHotKey() {
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, _, ctx in
+            Unmanaged<MenuBar>.fromOpaque(ctx!).takeUnretainedValue().headsOrTails()
+            return noErr
+        }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), nil)
+        RegisterEventHotKey(UInt32(kVK_ANSI_F), UInt32(controlKey | optionKey), EventHotKeyID(signature: 0x6D63, id: 1),
+                            GetApplicationEventTarget(), 0, &hotKey)
+    }
+
+    // Gamma to black always works; DDC standby also kills the backlight when the monitor listens.
+    func lockChanged(_ isLocked: Bool) {
+        guard prefs.bool(forKey: "lockBlackout") || !isLocked else { return }
+        locked = isLocked
+        applyGamma()
+        if let s = svc { q.async { _ = setVCP(s, 0xD6, isLocked ? 4 : 1) } }
+    }
+
+    @objc func toggleBlackout(_ i: NSMenuItem) {
+        i.state = i.state == .on ? .off : .on
+        prefs.set(i.state == .on, forKey: "lockBlackout")
+    }
+
     @objc func toggleWarm(_ i: NSMenuItem) {
         i.state = i.state == .on ? .off : .on
         prefs.set(i.state == .on, forKey: "warmAtNight")
@@ -361,7 +643,7 @@ final class MenuBar: NSObject, NSMenuDelegate {
 
     @objc func tick() {
         let h = Calendar.current.component(.hour, from: Date())
-        warm = prefs.bool(forKey: "warmAtNight") && (h >= 19 || h < 7)  // ponytail: fixed 7pm-7am, use sunset times if it matters
+        warm = nightPreset || prefs.bool(forKey: "warmAtNight") && (h >= 19 || h < 7)  // ponytail: fixed 7pm-7am, use sunset times if it matters
         applyGamma()
         // Picks up the Accessibility grant without a relaunch.
         if prefs.bool(forKey: "keys"), tap == nil { startTap(prompt: false) }
@@ -401,6 +683,7 @@ if cmd == "menubar" {
     withExtendedLifetime(MenuBar()) { app.run() }
     exit(0)
 }
+if cmd == "flip" { let deg = orientation() == 180 ? 0 : 180; rotate(deg); print("\(deg)°"); exit(0) }
 guard let svc = externalService() else { print("no external display found"); exit(1) }
 
 func getOrSet(_ code: UInt8) {

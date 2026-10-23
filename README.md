@@ -11,6 +11,11 @@ A tiny MonitorControl clone for Apple Silicon Macs, in one Swift file. It contro
 - Meeting Glow: brighter, warmer screen while the camera is on
 - Walk-Away: monitor off when your phone or watch leaves Bluetooth range
 - Optional power light toggle (monitor-specific VCP code)
+- Presets: Reading, Movie, Night
+- Rotate 0/90/180/270°, resolution (incl. HiDPI) and refresh rate pickers
+- Black out the monitor when the Mac locks
+- Disco mode (tint pulses with music via the mic), Disco Party (spins on beats)
+- Matrix tint after 2 min idle, Screen Wipe, Heads or Tails (⌃⌥F flips 0°/180° at random)
 - Start at login
 
 ## Build
@@ -30,6 +35,7 @@ mc off | on
 mc get <vcp>
 mc set <vcp> <value>
 mc scan
+mc flip
 ```
 
 ## Notes
